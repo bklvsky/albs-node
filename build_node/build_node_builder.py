@@ -14,9 +14,11 @@ import urllib.parse
 import platform
 import pprint
 import random
+import requests
 import threading
 import typing
 
+from cachetools import TTLCache
 from immudb_wrapper import ImmudbWrapper
 import requests
 import requests.adapters
@@ -30,6 +32,7 @@ from build_node.build_node_errors import BuildError, BuildExcluded
 from build_node.uploaders.pulp import PulpRpmUploader
 from build_node.utils.file_utils import (
     clean_dir,
+    file_url_exists,
     filter_files,
     rm_sudo,
 )
@@ -82,6 +85,10 @@ class BuildNodeBuilder(threading.Thread):
         self.__terminated_event = terminated_event
         self.__graceful_terminated_event = graceful_terminated_event
         self.__hostname = platform.node()
+        self.__cached_config = TTLCache(
+            maxsize=config.cache_size,
+            ttl=config.cache_update_interval,
+            )
 
     def run(self):
         log_file = os.path.join(self.__working_dir,
@@ -267,8 +274,18 @@ class BuildNodeBuilder(threading.Thread):
             artifacts_dir, only_logs=only_logs)
         return artifacts
 
+    def get_excluded_packages(self):
+        if 'excluded_packages' not in self.__cached_config:
+            uri = f'{self.__config.exclusions_url}/{self.__config.build_node_name}'
+            if file_url_exists(uri):
+                response = requests.get(uri).text
+                self.__cached_config['excluded_packages'] = response.splitlines()
+
+        return self.__cached_config.get('excluded_packages', [])
+
     def __request_task(self):
         supported_arches = [self.__config.base_arch]
+        excluded_packages = self.get_excluded_packages()
         if self.__config.base_arch == 'x86_64':
             supported_arches.append('i686')
         if self.__config.build_src:
@@ -277,6 +294,7 @@ class BuildNodeBuilder(threading.Thread):
             'get_task',
             err_msg="Can't request new task from master:",
             supported_arches=supported_arches,
+            excluded_packages=excluded_packages,
         )
         if not task:
             return
